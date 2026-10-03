@@ -2250,3 +2250,382 @@ def test_takeover_registration_advances_data_version(client, station, device):
     v0 = check(client)["data_version"]
     register_takeover(client, station, other, 100)
     assert check(client)["data_version"] == v0 + 1
+
+# ---------------------------------------------------------------- 下游断点领取（消费方订阅）
+
+def register_subscriber(client, name=None):
+    body = {} if name is None else {"name": name}
+    r = client.post("/subscribers", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def pull(client, key, **params):
+    return client.get("/subscriber/releases", headers={"X-Subscriber-Key": key}, params=params)
+
+
+def ack(client, key, last_id):
+    return client.post(
+        "/subscriber/ack", headers={"X-Subscriber-Key": key}, json={"last_publication_id": last_id}
+    )
+
+
+def pub_ids(batch):
+    return [rel["publication_id"] for rel in batch["releases"]]
+
+
+def test_register_subscriber_returns_one_time_key(client):
+    d = register_subscriber(client, "值班甲")
+    assert d["name"] == "值班甲"
+    assert isinstance(d["subscriber_id"], int)
+    assert len(d["key"]) >= 20
+    # 密钥仅展示一次：游标/状态接口均不回传密钥
+    st = client.get("/subscriber/status", headers={"X-Subscriber-Key": d["key"]}).json()
+    assert "key" not in st
+    assert st["acked_publication_id"] == 0
+    assert st["next_from_publication_id"] == 1
+    assert st["pending_batch"] is None
+    # 两个消费方密钥互不相同
+    assert register_subscriber(client)["key"] != d["key"]
+
+
+def test_register_subscriber_blank_name_rejected(client):
+    r = client.post("/subscribers", json={"name": "   "})
+    assert r.status_code == 400
+
+
+def test_pull_requires_valid_key(client):
+    assert client.get("/subscriber/releases").status_code == 401
+    assert client.get("/subscriber/releases", headers={"X-Subscriber-Key": "bogus"}).status_code == 401
+    assert client.post(
+        "/subscriber/ack", headers={"X-Subscriber-Key": "bogus"}, json={"last_publication_id": 1}
+    ).status_code == 401
+    assert client.get("/subscriber/status").status_code == 401
+
+
+def test_pull_empty_when_no_publication(client):
+    key = register_subscriber(client)["key"]
+    r = pull(client, key)
+    assert r.status_code == 200
+    b = r.json()["batch"]
+    assert b["count"] == 0 and b["releases"] == []
+    assert b["from_publication_id"] is None and b["last_publication_id"] is None
+    assert r.json()["has_more"] is False
+    # 无批次时确认任何编号均拒绝
+    assert ack(client, key, 1).status_code == 409
+
+
+def test_first_release_compared_with_empty_snapshot_and_no_change_occupies_slot(client, station, device):
+    _make_warning(client, device)
+    key = register_subscriber(client)["key"]
+    p1 = client.post("/publish", json={"note": "首发布"}).json()["publication_id"]
+    # 无变化也产生发布并占序位
+    p2 = client.post("/publish", json={"note": "无变化发布"}).json()["publication_id"]
+
+    r = pull(client, key, limit=10).json()
+    assert pub_ids(r["batch"]) == [p1, p2]
+    rel1, rel2 = r["batch"]["releases"]
+    # 发布 1：相对空快照
+    assert rel1["baseline_publication_id"] is None
+    s1 = rel1["stations"][0]
+    assert s1["new_object"] is True
+    assert s1["status_before"] is None and s1["status_after"] == "warning"
+    assert s1["events_added"] == [
+        {"type": "warning", "at": iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"), "occurrence": 1}
+    ]
+    assert s1["events_removed"] == []
+    assert rel1["changed"] is True
+    # 发布 2：相对发布 1 无任何变化，但仍是独立序位
+    assert rel2["baseline_publication_id"] == p1
+    assert rel2["changed"] is False
+    s2 = rel2["stations"][0]
+    assert s2["status_before"] == "warning" and s2["status_after"] == "warning"
+    assert s2["changed"] is False and s2["new_object"] is False
+    assert s2["events_added"] == [] and s2["events_removed"] == []
+
+
+def test_repeated_pull_returns_same_batch_until_ack(client, station, device):
+    _make_warning(client, device)
+    key = register_subscriber(client)["key"]
+    client.post("/publish")
+    first = pull(client, key, limit=1).json()["batch"]
+    assert pub_ids(first) == [1]
+    # 拉取后、确认前又产生新发布
+    client.post("/publish")
+    # 重复拉取（即便换了 limit）仍返回同一批
+    again = pull(client, key, limit=100).json()["batch"]
+    assert pub_ids(again) == [1]
+    assert again["last_publication_id"] == 1
+
+
+def test_ack_only_accepts_batch_last_and_advances_cursor(client, station, device):
+    _make_warning(client, device)
+    key = register_subscriber(client)["key"]
+    for i in range(3):
+        client.post("/publish", json={"note": f"p{i}"})
+    pull(client, key, limit=2)  # 批次 [1,2]
+    # 越序 / 滞后均拒绝，且游标不动
+    r1 = ack(client, key, 1)
+    assert r1.status_code == 409 and r1.json()["detail"]["reason"] == "out_of_order"
+    assert ack(client, key, 3).status_code == 409
+    assert client.get("/subscriber/status", headers={"X-Subscriber-Key": key}).json()[
+        "acked_publication_id"
+    ] == 0
+    # 只接受末尾 2
+    assert ack(client, key, 2).status_code == 200
+    nxt = pull(client, key).json()
+    assert pub_ids(nxt["batch"]) == [3]
+    assert nxt["batch"]["releases"][0]["baseline_publication_id"] == 2
+    assert ack(client, key, 3).status_code == 200
+
+
+def test_ack_idempotent_repeat(client, station, device):
+    _make_warning(client, device)
+    key = register_subscriber(client)["key"]
+    client.post("/publish")
+    pull(client, key)
+    assert ack(client, key, 1).status_code == 200
+    # 批次已清空后重复确认同一末尾编号 → 幂等成功
+    r = ack(client, key, 1)
+    assert r.status_code == 200
+    assert r.json()["acked_publication_id"] == 1
+    # 但确认游标之后的编号仍是越序拒绝
+    assert ack(client, key, 2).status_code == 409
+
+
+def test_ack_unknown_publication_rejected(client):
+    key = register_subscriber(client)["key"]
+    # 无批次、游标 0：确认 5 → no_pending_batch
+    r = ack(client, key, 5)
+    assert r.status_code == 409 and r.json()["detail"]["reason"] == "no_pending_batch"
+
+
+def test_subscriber_cursors_independent(client, station, device):
+    _make_warning(client, device)
+    client.post("/publish", json={"note": "p1"})
+    ka = register_subscriber(client, "甲")["key"]
+    kb = register_subscriber(client, "乙")["key"]
+    pull(client, ka)
+    assert ack(client, ka, 1).status_code == 200
+    # 乙不受甲确认影响：仍能完整领取发布 1
+    rb = pull(client, kb).json()
+    assert pub_ids(rb["batch"]) == [1]
+    # 新发布后：甲从 2 开始；乙仍卡在未确认的批次 [1]
+    client.post("/publish", json={"note": "p2"})
+    assert pub_ids(pull(client, ka).json()["batch"]) == [2]
+    assert pub_ids(pull(client, kb).json()["batch"]) == [1]
+
+
+def test_history_replay_for_late_subscriber(client, station, device):
+    _make_warning(client, device)
+    client.post("/publish", json={"note": "历史1"})
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)  # 解除
+    client.post("/publish", json={"note": "历史2"})
+    # 后登记的消费方可从发布 1 回放
+    key = register_subscriber(client)["key"]
+    rels = pull(client, key, limit=10).json()["batch"]["releases"]
+    assert [r["publication_id"] for r in rels] == [1, 2]
+    assert rels[0]["baseline_publication_id"] is None
+    assert rels[1]["stations"][0]["events_added"][0]["type"] == "cleared"
+
+
+def test_retroactive_revision_shows_event_revoked(client, station, device):
+    # 发布 1 含 warning；追溯作废触发读数后重发布：warning 必须以撤销(events_removed)呈现
+    _make_warning(client, device)
+    client.post("/publish", json={"note": "修订前"})
+    key = register_subscriber(client)["key"]
+    pull(client, key)
+    ack(client, key, 1)
+
+    client.post("/readings/2/void", json={"reason": "误报剔除"})  # 预警不再成立
+    client.post("/publish", json={"note": "修订后"})
+    rel = pull(client, key).json()["batch"]["releases"][0]
+    s = rel["stations"][0]
+    assert s["status_before"] == "warning" and s["status_after"] == "normal"
+    assert s["events_added"] == []
+    assert s["events_removed"] == [
+        {"type": "warning", "at": iso(BASE + timedelta(minutes=10)).replace("+00:00", "Z"), "occurrence": 1}
+    ]
+    assert rel["events_removed"][0]["object_type"] == "station"
+    assert rel["events_removed"][0]["object_id"] == station
+
+
+def test_repeated_event_occurrence_identity_across_releases(client, station, device):
+    # warning#1 发布 → cleared#1、warning#2 发布：下游按对象+类型+时刻+出现次数识别
+    _make_warning(client, device)  # warning @10
+    client.post("/publish")
+    key = register_subscriber(client)["key"]
+    pull(client, key); ack(client, key, 1)
+    upload(client, device, 4, 15, 7.0)
+    upload(client, device, 5, 21, 7.0)   # cleared @21
+    upload(client, device, 6, 30, 12.0)
+    upload(client, device, 7, 35, 12.0)
+    upload(client, device, 8, 40, 12.0)  # warning @40
+    client.post("/publish")
+    s = pull(client, key).json()["batch"]["releases"][0]["stations"][0]
+    added = {(e["type"], e["at"], e["occurrence"]) for e in s["events_added"]}
+    assert ("cleared", iso(BASE + timedelta(minutes=21)).replace("+00:00", "Z"), 1) in added
+    assert ("warning", iso(BASE + timedelta(minutes=40)).replace("+00:00", "Z"), 2) in added
+    assert not any(e["type"] == "warning" and e["occurrence"] == 1 for e in s["events_added"])
+
+
+def test_pending_changes_and_failed_confirm_not_visible(client, station, device):
+    key = register_subscriber(client)["key"]
+    _make_warning(client, device)
+    # 待发布存在但未发布：下游看不到任何发布
+    assert pull(client, key).json()["batch"]["releases"] == []
+    # 受控核对后被写入作废 → 确认失败，不产生发布
+    token = check(client)["token"]
+    upload(client, device, 9, 99, 5.0)
+    assert confirm(client, token).status_code == 409
+    assert pull(client, key).json()["batch"]["releases"] == []
+    # 直接发布后下游才可见，且内容是当前冻结（读数 9 低水位不改变 warning 结论）
+    client.post("/publish", json={"note": "唯一发布"})
+    rels = pull(client, key).json()["batch"]["releases"]
+    assert [r["publication_id"] for r in rels] == [1]
+
+
+def test_successful_controlled_confirm_is_visible_as_release(client, station, device):
+    _make_warning(client, device)
+    key = register_subscriber(client)["key"]
+    token = check(client)["token"]
+    r = confirm(client, token, note="受控发布")
+    assert r.status_code == 201
+    pub_id = r.json()["publication_id"]
+    rels = pull(client, key).json()["batch"]["releases"]
+    assert [x["publication_id"] for x in rels] == [pub_id]
+    assert rels[0]["note"] == "受控发布"
+    assert rels[0]["stations"][0]["status_after"] == "warning"
+
+
+def test_zone_diff_delivered(client, station, device):
+    sid2 = client.post("/stations", json={"name": "乙站", "rise_threshold": 10.0, "clear_threshold": 8.0}).json()["id"]
+    client.post(f"/stations/{sid2}/devices", json={"device_no": "D9"})
+    client.post(
+        "/zones",
+        json={"name": "片区", "effective_at": iso(BASE), "station_ids": [station, sid2], "trigger_count": 1},
+    )
+    _make_warning(client, device)
+    client.post("/publish")
+    key = register_subscriber(client)["key"]
+    z = pull(client, key).json()["batch"]["releases"][0]["zones"][0]
+    assert z["new_object"] is True
+    assert z["status_before"] is None and z["status_after"] == "warning"
+    assert z["events_added"][0]["type"] == "warning" and z["events_added"][0]["occurrence"] == 1
+
+
+def test_new_object_appears_in_later_release_with_null_before(client, station, device):
+    # 发布 1 只有站 1；之后登记站 2（无读数）并发布 → 发布 2 中站 2 前值为 null
+    _make_warning(client, device)
+    client.post("/publish")
+    sid2 = client.post("/stations", json={"name": "新站", "rise_threshold": 10.0, "clear_threshold": 8.0}).json()["id"]
+    client.post("/publish")
+    key = register_subscriber(client)["key"]
+    rels = pull(client, key, limit=10).json()["batch"]["releases"]
+    by_station = {s["station_id"]: s for s in rels[1]["stations"]}
+    assert by_station[sid2]["new_object"] is True
+    assert by_station[sid2]["status_before"] is None
+    assert by_station[sid2]["status_after"] == "normal"
+
+
+def test_pull_limit_batching_and_has_more(client, station, device):
+    client.post("/publish")
+    client.post("/publish")
+    client.post("/publish")
+    client.post("/publish")
+    key = register_subscriber(client)["key"]
+    r = pull(client, key, limit=2).json()
+    assert pub_ids(r["batch"]) == [1, 2] and r["has_more"] is True
+    ack(client, key, 2)
+    r = pull(client, key, limit=2).json()
+    assert pub_ids(r["batch"]) == [3, 4] and r["has_more"] is False
+    ack(client, key, 4)
+    assert pull(client, key).json()["batch"]["releases"] == []
+
+
+def test_invalid_limit_rejected(client):
+    key = register_subscriber(client)["key"]
+    # 服务将参数校验错误统一映射为 400
+    assert pull(client, key, limit=0).status_code == 400
+    assert pull(client, key, limit=100000).status_code == 400
+
+
+def test_cursor_persists_across_restart(tmp_path, station, device):
+    db_path = str(tmp_path / "restart.db")
+    settings = Settings(
+        db_path=db_path, min_water_level=-50, max_water_level=1000,
+        segment_gap_minutes=15, rise_min_count=3, rise_min_span_minutes=10,
+        clear_min_count=2, clear_min_span_minutes=5,
+    )
+    with TestClient(create_app(settings)) as c1:
+        _make_warning(c1, "DEV-001")
+        c1.post("/publish", json={"note": "p1"})
+        d = c1.post("/subscribers", json={"name": "重启测试"}).json()
+        key = d["key"]
+        assert pub_ids(pull(c1, key).json()["batch"]) == [1]
+        ack(c1, key, 1)
+        c1.post("/publish", json={"note": "p2"})
+
+    # 重启：同一数据库文件重新构建应用，游标续读
+    with TestClient(create_app(settings)) as c2:
+        st = c2.get("/subscriber/status", headers={"X-Subscriber-Key": key}).json()
+        assert st["acked_publication_id"] == 1
+        assert pub_ids(pull(c2, key).json()["batch"]) == [2]
+
+
+def test_concurrent_pull_and_publish_no_loss_or_crossover(client, station, device):
+    for i, m in enumerate([0, 5, 10], start=1):
+        upload(client, device, i, m, 12.0)
+    key = register_subscriber(client)["key"]
+    seen: list[int] = []
+    errors: list[Exception] = []
+
+    def publisher():
+        try:
+            for _ in range(6):
+                r = client.post("/publish")
+                assert r.status_code == 201, r.text
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    def consumer():
+        try:
+            for _ in range(12):
+                b = pull(client, key, limit=1).json()["batch"]
+                if b["last_publication_id"] is None:
+                    continue
+                ids = pub_ids(b)
+                assert len(ids) == 1
+                r = ack(client, key, b["last_publication_id"])
+                assert r.status_code == 200, r.text
+                seen.extend(ids)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    tp = threading.Thread(target=publisher)
+    tc = threading.Thread(target=consumer)
+    tp.start(); tc.start()
+    tp.join(); tc.join()
+    assert not errors, errors
+    # 全部 6 个发布被领取恰好一次：无漏项、无串项/重复
+    assert sorted(seen) == [1, 2, 3, 4, 5, 6]
+
+
+def test_concurrent_pull_same_subscriber_returns_same_batch(client, station, device):
+    _make_warning(client, device)
+    client.post("/publish")
+    client.post("/publish")
+    key = register_subscriber(client)["key"]
+    batches: list[list[int]] = []
+
+    def worker():
+        batches.append(pub_ids(pull(client, key, limit=1).json()["batch"]))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # 先到者建立批次 [1]，其余重复拉取返回同批
+    assert batches == [[1]] * 6

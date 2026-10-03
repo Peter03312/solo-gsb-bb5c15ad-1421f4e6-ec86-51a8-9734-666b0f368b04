@@ -138,6 +138,27 @@ CREATE TABLE IF NOT EXISTS publish_checks (
     confirmed_at  TEXT,                         -- 成功确认时间
     confirmed_publication_id INTEGER            -- 成功确认生成的发布 id
 );
+
+-- 下游值班系统消费方：登记时发放一次性密钥（仅存其 SHA-256 哈希，明文仅返回一次）。
+CREATE TABLE IF NOT EXISTS subscribers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    key_hash        TEXT NOT NULL UNIQUE,       -- 消费方密钥的 SHA-256 哈希
+    name            TEXT,                       -- 可选备注（如值班系统名称）
+    created_at      TEXT NOT NULL,
+    last_pulled_at  TEXT                        -- 最近一次拉取时间（可空）
+);
+
+-- 消费方领取游标（各消费方独立一行，随事务持久化，重启后续读）：
+-- acked_publication_id：已确认到的发布编号（0 = 尚未确认任何发布，首次以空快照比较）；
+-- pending_from / pending_to：当前“未确认批次”的起止发布编号（含端点）。
+--   pending_to IS NOT NULL 时重复拉取固定返回该批；只有确认 pending_to 才推进游标并清空批次。
+CREATE TABLE IF NOT EXISTS subscriber_cursors (
+    subscriber_id   INTEGER PRIMARY KEY REFERENCES subscribers(id),
+    acked_publication_id INTEGER NOT NULL DEFAULT 0,
+    pending_from    INTEGER,                    -- 未确认批次首发布编号（无批次为 NULL）
+    pending_to      INTEGER,                    -- 未确认批次末发布编号；确认只接受该编号
+    updated_at      TEXT NOT NULL
+);
 """
 
 META_INIT = """

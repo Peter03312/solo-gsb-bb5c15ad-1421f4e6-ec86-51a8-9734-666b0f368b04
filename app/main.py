@@ -14,7 +14,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -29,6 +29,8 @@ from .schemas import (
     PublishRequest,
     ReadingIngest,
     StationCreate,
+    SubscriberAckRequest,
+    SubscriberRegisterRequest,
     ThresholdVersionCreate,
     VoidRequest,
     ZoneCreate,
@@ -171,8 +173,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.5.0",
-        description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动，以及受控发布（核对凭证 → 确认冻结）。",
+        version="1.6.0",
+        description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动、受控发布（核对凭证 → 确认冻结），以及下游值班系统断点领取（一次性密钥登记、按批拉取已冻结发布差异、末编号确认、游标独立可续读）。",
     )
     app.state.db = db
     app.state.settings = settings
@@ -1226,34 +1228,32 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "zones": {r["zone_id"]: json.loads(r["timeline_json"]) for r in zone_rows},
         }
 
-    def build_check_result(
-        conn: sqlite3.Connection,
-        baseline_pub: Optional[sqlite3.Row],
-        pending: dict[str, Any],
+    def build_snapshot_diff(
+        after: dict[str, Any],
+        before: dict[str, Any],
     ) -> dict[str, Any]:
-        """以待发布结果相对基准快照（首次发布为空快照）做核对，构造核对差异。
+        """对比两份“全量快照负载”（均为 {"stations": [...], "zones": [...]}）。
 
-        - 各站及责任区给出状态前值/后值；新登记对象按空基准（before=null）比较；
-        - 新增/消失事件按 (对象, 事件类型, 发生时刻, 出现次数) 的多重集合比较。
+        受控发布核对（待发布 vs 最新公开快照）与下游断点领取（相邻两次已冻结发布
+        互比、首次以空快照为基准）共用本函数，保证状态前后值与事件新增/撤销的
+        身份规则完全一致：事件按（对象, 类型, 发生时刻, 同对象同类型出现次数）
+        识别；追溯修订造成的历史事件消失计入 events_removed（撤销）。
         """
-        baseline = load_baseline_payload(conn, baseline_pub["id"]) if baseline_pub is not None else {"stations": {}, "zones": {}}
-
         station_diffs: list[dict[str, Any]] = []
         events_added: list[dict[str, Any]] = []
         events_removed: list[dict[str, Any]] = []
-        for tl in pending["stations"]:
+        for tl in after["stations"]:
             sid = tl["station_id"]
-            base_tl = baseline["stations"].get(sid)
-            before = base_tl["status"] if base_tl is not None else None
-            after = tl["status"]
+            base_tl = before["stations"].get(sid)
+            status_before = base_tl["status"] if base_tl is not None else None
             added, removed = _event_diff(tl["events"], base_tl["events"] if base_tl is not None else [])
             station_diffs.append(
                 {
                     "station_id": sid,
                     "station_name": tl["station_name"],
-                    "status_before": before,
-                    "status_after": after,
-                    "changed": before != after,
+                    "status_before": status_before,
+                    "status_after": tl["status"],
+                    "changed": status_before != tl["status"],
                     "new_object": base_tl is None,
                     "events_added": added,
                     "events_removed": removed,
@@ -1265,19 +1265,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 events_removed.append({"object_type": "station", "object_id": sid, **ev})
 
         zone_diffs: list[dict[str, Any]] = []
-        for ztl in pending["zones"]:
+        for ztl in after["zones"]:
             zid = ztl["zone_id"]
-            base_ztl = baseline["zones"].get(zid)
-            before = base_ztl["status"] if base_ztl is not None else None
-            after = ztl["status"]
+            base_ztl = before["zones"].get(zid)
+            status_before = base_ztl["status"] if base_ztl is not None else None
             added, removed = _event_diff(ztl["events"], base_ztl["events"] if base_ztl is not None else [])
             zone_diffs.append(
                 {
                     "zone_id": zid,
                     "zone_name": ztl["zone_name"],
-                    "status_before": before,
-                    "status_after": after,
-                    "changed": before != after,
+                    "status_before": status_before,
+                    "status_after": ztl["status"],
+                    "changed": status_before != ztl["status"],
                     "new_object": base_ztl is None,
                     "trigger_count": ztl["trigger_count"],
                     "warning_station_ids_before": (
@@ -1304,8 +1303,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             }
 
         return {
-            "baseline_publication_id": baseline_pub["id"] if baseline_pub is not None else None,
-            "baseline_published_at": baseline_pub["published_at"] if baseline_pub is not None else None,
             "stations": station_diffs,
             "zones": zone_diffs,
             "events_added": sorted(
@@ -1324,6 +1321,23 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "events_added": _counts(events_added),
                 "events_removed": _counts(events_removed),
             },
+        }
+
+    def build_check_result(
+        conn: sqlite3.Connection,
+        baseline_pub: Optional[sqlite3.Row],
+        pending: dict[str, Any],
+    ) -> dict[str, Any]:
+        """以待发布结果相对基准快照（首次发布为空快照）做核对，构造核对差异。
+
+        - 各站及责任区给出状态前后值；新登记对象按空基准（before=null）比较；
+        - 新增/消失事件按 (对象, 事件类型, 发生时刻, 出现次数) 的多重集合比较。
+        """
+        baseline = load_baseline_payload(conn, baseline_pub["id"]) if baseline_pub is not None else {"stations": {}, "zones": {}}
+        return {
+            "baseline_publication_id": baseline_pub["id"] if baseline_pub is not None else None,
+            "baseline_published_at": baseline_pub["published_at"] if baseline_pub is not None else None,
+            **build_snapshot_diff(pending, baseline),
         }
 
     def freeze_publication(conn: sqlite3.Connection, note: Optional[str], now: str) -> tuple[int, dict[str, Any], dict[str, Any]]:
@@ -1558,6 +1572,289 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "published_at": row["published_at"],
             "published": True,
             **json.loads(row["timeline_json"]),
+        }
+
+    # ------------------------------------------------------------ 下游断点领取（消费方订阅）
+    #
+    # 语义：消费方登记后取得仅展示一次的密钥；凭密钥拉取“未确认的下一批”已冻结
+    # 发布，每批按发布编号升序返回，每条给出本发布相对上一发布的站点/责任区状态
+    # 前后值及预警/解除事件的新增（events_added）与撤销（events_removed）；首次
+    # 以空快照比较，无变化发布仍占序位；历史发布可回放（新消费方从发布 1 起）。
+    # 未确认前重复拉取返回同批；确认只接受该批末尾编号，重复确认幂等，越序或无
+    # 批次拒绝；只依据直接发布或受控确认成功冻结的快照——待发布变化与失败确认
+    # 不产生发布、故天然不可见。各消费方游标独立持久化，重启后续读。
+
+    DEFAULT_PULL_LIMIT = 100
+    MAX_PULL_LIMIT = 1000
+
+    def load_frozen_payload(conn: sqlite3.Connection, pub_id: int) -> dict[str, Any]:
+        """读取某次已冻结发布的全量负载，按 id 索引（供快照互比的基准侧使用）。"""
+        return load_baseline_payload(conn, pub_id)  # {"stations": {id: tl}, "zones": {id: tl}}
+
+    def build_release_entry(
+        conn: sqlite3.Connection,
+        pub: sqlite3.Row,
+        prev_pub: Optional[sqlite3.Row],
+    ) -> dict[str, Any]:
+        """构造一条下游发布条目：本发布冻结快照相对上一发布（首次为空快照）的差异。"""
+        loaded = load_baseline_payload(conn, pub["id"])
+        # after 侧为按 id 升序的时间线列表（与 build_pending_payload 形状一致）
+        payload = {
+            "stations": [loaded["stations"][k] for k in sorted(loaded["stations"])],
+            "zones": [loaded["zones"][k] for k in sorted(loaded["zones"])],
+        }
+        if prev_pub is not None:
+            prev_payload = load_frozen_payload(conn, prev_pub["id"])
+        else:
+            # 首次以空快照比较：全部对象前值为 null（new_object），事件全部计为新增
+            prev_payload = {"stations": {}, "zones": {}}
+        diff = build_snapshot_diff(payload, prev_payload)
+        changed = (
+            diff["summary"]["stations_status_changed"] > 0
+            or diff["summary"]["zones_status_changed"] > 0
+            or diff["summary"]["events_added"]["total"] > 0
+            or diff["summary"]["events_removed"]["total"] > 0
+            or diff["summary"]["stations_new"] > 0
+            or diff["summary"]["zones_new"] > 0
+        )
+        return {
+            "publication_id": pub["id"],
+            "published_at": pub["published_at"],
+            "note": pub["note"],
+            # 相对的上一发布编号（首次为空快照时为 null）
+            "baseline_publication_id": prev_pub["id"] if prev_pub is not None else None,
+            "changed": changed,  # 无变化发布仍占序位，仅以 changed=false 标识
+            **diff,
+        }
+
+    def get_subscriber_or_401(
+        conn: sqlite3.Connection, subscriber_key: Optional[str]
+    ) -> sqlite3.Row:
+        """按 X-Subscriber-Key 解析消费方；缺失/未知密钥一律 401（不区分以免枚举）。"""
+        if not subscriber_key:
+            raise HTTPException(status_code=401, detail="缺少消费方密钥请求头 X-Subscriber-Key")
+        row = conn.execute(
+            "SELECT * FROM subscribers WHERE key_hash=?", (hash_token(subscriber_key),)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="无效的消费方密钥")
+        return row
+
+    def get_cursor(conn: sqlite3.Connection, subscriber_id: int) -> sqlite3.Row:
+        return conn.execute(
+            "SELECT * FROM subscriber_cursors WHERE subscriber_id=?", (subscriber_id,)
+        ).fetchone()
+
+    def publication_exists(conn: sqlite3.Connection, pub_id: int) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM publications WHERE id=?", (pub_id,)
+        ).fetchone() is not None
+
+    @app.post("/subscribers", status_code=201, tags=["下游订阅"])
+    def register_subscriber(body: Optional[SubscriberRegisterRequest] = None) -> dict[str, Any]:
+        """登记下游值班系统消费方，发放**仅展示一次**的领取密钥。
+
+        - 密钥为随机令牌，服务端仅存其 SHA-256 哈希：本响应是唯一一次取得明文的机会；
+        - 新消费方游标从发布 1 开始（已有历史发布也可回放），首次拉取以空快照比较；
+        - name 为可选备注（纯空白 → 400）。
+        """
+        name = body.name if body is not None else None
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            # token_urlsafe(32) 冲突概率可忽略；唯一约束兜底时重试
+            for _ in range(3):
+                key = secrets.token_urlsafe(32)
+                key_hash = hash_token(key)
+                try:
+                    cur = conn.execute(
+                        "INSERT INTO subscribers(key_hash, name, created_at) VALUES (?,?,?)",
+                        (key_hash, name, now),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                subscriber_id = cur.lastrowid
+                conn.execute(
+                    "INSERT INTO subscriber_cursors(subscriber_id, acked_publication_id, updated_at) "
+                    "VALUES (?, 0, ?)",
+                    (subscriber_id, now),
+                )
+                break
+            else:
+                raise HTTPException(status_code=500, detail="消费方密钥生成冲突，请重试")
+        return {
+            "subscriber_id": subscriber_id,
+            "name": name,
+            "key": key,  # 仅本次返回
+            "created_at": now,
+            "hint": "密钥仅展示一次：凭 X-Subscriber-Key 请求头拉取 /subscriber/releases 并确认",
+        }
+
+    @app.get("/subscriber/releases", tags=["下游订阅"])
+    def pull_releases(
+        limit: int = Query(default=DEFAULT_PULL_LIMIT, ge=1, le=MAX_PULL_LIMIT),
+        x_subscriber_key: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """拉取未确认的下一批发布（编号升序）。
+
+        - 存在未确认批次时：**重复拉取返回同一批**（同起止编号、同内容），不随新发布推进；
+        - 无未确认批次时：在同一写事务内确定新批次范围（游标之后至多 limit 条已冻结发布），
+          从而与并发发布互斥——新发布要么整体进入本批，要么留到确认后的下一批，不漏不串；
+        - 尚无新发布时批次为空（releases=[]，has_more=false，无末编号可确认）；
+        - 每条发布相对其**上一发布**给出站点/责任区状态前后值与事件新增/撤销；
+          首次以空快照比较；无变化发布仍占序位（changed=false）。
+        """
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            sub = get_subscriber_or_401(conn, x_subscriber_key)
+            cursor = get_cursor(conn, sub["id"])
+            if cursor["pending_to"] is not None:
+                # 未确认批次：固定返回同批，不重新取数扩展
+                pending_from, pending_to = cursor["pending_from"], cursor["pending_to"]
+                conn.execute(
+                    "UPDATE subscribers SET last_pulled_at=? WHERE id=?", (now, sub["id"])
+                )
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM publications WHERE id > ? ORDER BY id LIMIT ?",
+                    (cursor["acked_publication_id"], limit),
+                ).fetchall()
+                conn.execute(
+                    "UPDATE subscribers SET last_pulled_at=? WHERE id=?", (now, sub["id"])
+                )
+                if rows:
+                    pending_from, pending_to = rows[0]["id"], rows[-1]["id"]
+                    conn.execute(
+                        "UPDATE subscriber_cursors SET pending_from=?, pending_to=?, updated_at=? "
+                        "WHERE subscriber_id=?",
+                        (pending_from, pending_to, now, sub["id"]),
+                    )
+                else:
+                    pending_from = pending_to = None
+
+            releases: list[dict[str, Any]] = []
+            if pending_to is not None:
+                pubs = conn.execute(
+                    "SELECT * FROM publications WHERE id BETWEEN ? AND ? ORDER BY id",
+                    (pending_from, pending_to),
+                ).fetchall()
+                prev_id = cursor["acked_publication_id"]
+                prev_pub = (
+                    conn.execute("SELECT * FROM publications WHERE id=?", (prev_id,)).fetchone()
+                    if prev_id > 0
+                    else None
+                )
+                for pub in pubs:
+                    releases.append(build_release_entry(conn, pub, prev_pub))
+                    prev_pub = pub
+                latest_id = conn.execute(
+                    "SELECT MAX(id) AS m FROM publications"
+                ).fetchone()["m"]
+                has_more = latest_id is not None and latest_id > pending_to
+            else:
+                has_more = False
+
+        return {
+            "subscriber_id": sub["id"],
+            "acked_publication_id": cursor["acked_publication_id"],
+            "batch": {
+                "from_publication_id": pending_from,
+                "last_publication_id": pending_to,
+                "count": len(releases),
+                "releases": releases,
+            },
+            "has_more": has_more,
+            "pulled_at": now,
+        }
+
+    @app.post("/subscriber/ack", tags=["下游订阅"])
+    def ack_releases(
+        body: SubscriberAckRequest,
+        x_subscriber_key: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """确认一批发布：**只接受当前未确认批次的末尾编号**。
+
+        - 编号与批次末尾一致 → 游标推进到该编号、清空批次，下一次拉取取后续发布；
+        - 重复确认同一末尾编号（批次已清空、游标恰在该编号）→ **幂等成功**；
+        - 越序（大于批次末尾 / 跳号）、滞后（小于批次末尾）、尚无批次却确认未来编号 → **409**；
+        - 引用不存在的发布编号 → **409**；密钥缺失/无效 → **401**。
+        """
+        now = iso_z(utc_now())
+        with db.write_tx() as conn:
+            sub = get_subscriber_or_401(conn, x_subscriber_key)
+            cursor = get_cursor(conn, sub["id"])
+            target = body.last_publication_id
+
+            if cursor["pending_to"] is not None:
+                if target != cursor["pending_to"]:
+                    # 越序或滞后：确认只接受该批末尾编号
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "out_of_order",
+                            "message": "确认编号必须是当前未确认批次的末尾编号",
+                            "expected_last_publication_id": cursor["pending_to"],
+                            "received_publication_id": target,
+                        },
+                    )
+                new_acked = target
+            else:
+                if target == cursor["acked_publication_id"]:
+                    # 重复确认幂等：无未确认批次且确认的正是已确认到的末尾编号
+                    new_acked = target
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "no_pending_batch",
+                            "message": "没有未确认批次：请先拉取，且只能确认已拉取批次的末尾编号",
+                            "acked_publication_id": cursor["acked_publication_id"],
+                            "received_publication_id": target,
+                        },
+                    )
+
+            if not publication_exists(conn, new_acked):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason": "unknown_publication", "message": f"发布 {new_acked} 不存在"},
+                )
+
+            conn.execute(
+                "UPDATE subscriber_cursors SET acked_publication_id=?, pending_from=NULL, "
+                "pending_to=NULL, updated_at=? WHERE subscriber_id=?",
+                (new_acked, now, sub["id"]),
+            )
+        return {
+            "subscriber_id": sub["id"],
+            "acked_publication_id": new_acked,
+            "next_from_publication_id": new_acked + 1,
+            "acknowledged_at": now,
+        }
+
+    @app.get("/subscriber/status", tags=["下游订阅"])
+    def subscriber_status(
+        x_subscriber_key: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """查询本消费方领取游标（不含密钥）：已确认编号与当前未确认批次范围。"""
+        with db.read() as conn:
+            sub = get_subscriber_or_401(conn, x_subscriber_key)
+            cursor = get_cursor(conn, sub["id"])
+            latest_id = conn.execute("SELECT MAX(id) AS m FROM publications").fetchone()["m"]
+        return {
+            "subscriber_id": sub["id"],
+            "name": sub["name"],
+            "created_at": sub["created_at"],
+            "last_pulled_at": sub["last_pulled_at"],
+            "acked_publication_id": cursor["acked_publication_id"],
+            "next_from_publication_id": cursor["acked_publication_id"] + 1,
+            "pending_batch": (
+                None
+                if cursor["pending_to"] is None
+                else {
+                    "from_publication_id": cursor["pending_from"],
+                    "last_publication_id": cursor["pending_to"],
+                }
+            ),
+            "latest_publication_id": latest_id,
         }
 
     # ------------------------------------------------------------ 健康检查

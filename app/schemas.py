@@ -93,6 +93,27 @@ class PublishConfirmRequest(BaseModel):
     note: Optional[str] = Field(default=None, max_length=500, description="发布备注（可选）")
 
 
+class SubscriberRegisterRequest(BaseModel):
+    """下游值班系统消费方登记：name 仅作备注，密钥由服务端生成且只展示一次。"""
+
+    model_config = ConfigDict(extra="ignore")
+    name: Optional[str] = Field(default=None, max_length=200, description="消费方备注（可选）")
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("不得为空白")
+        return v.strip() if v is not None else None
+
+
+class SubscriberAckRequest(BaseModel):
+    """消费方确认：只接受当前未确认批次的末发布编号（last_publication_id）。"""
+
+    model_config = ConfigDict(extra="ignore")
+    last_publication_id: int = Field(ge=1, description="本批发布的末尾编号")
+
+
 class ThresholdVersionCreate(BaseModel):
     """防汛方案调整：登记某站的一版阈值（自生效时间起采用）。"""
 

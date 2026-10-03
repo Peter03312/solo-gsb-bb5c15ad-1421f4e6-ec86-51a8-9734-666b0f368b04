@@ -246,6 +246,110 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `POST /publish` 的响应、`GET /publications/{id}` 与 `GET /public/current` 在原有字段之外**新增** `zones` / `zone_timelines`（公开负载中均带 `published: true`）；原有字段与其他接口的请求响应保持不变。
 
+## 下游值班系统断点领取（一次性密钥 → 按批拉取 → 末编号确认）
+
+下游值班系统以**断点续传**方式消费**公开预警变更**：消费方登记后取得一枚**仅展示一次**的密钥；凭密钥（请求头 `X-Subscriber-Key`）拉取未确认的下一批已冻结发布；每条发布给出其编号及**相对上一发布**的站点/责任区状态前后值与预警、解除事件的**新增/撤销**；确认后游标推进，服务重启后可续读。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/subscribers` | 消费方登记（可选 `{name}`），返回消费方编号与**仅展示一次**的密钥 `key` |
+| GET | `/subscriber/releases?limit=100` | 拉取未确认的下一批发布（编号升序，1 ≤ limit ≤ 1000，默认 100） |
+| POST | `/subscriber/ack` | 确认批次：`{last_publication_id}`，只接受本批末尾编号 |
+| GET | `/subscriber/status` | 查询本消费方游标（已确认编号 / 未确认批次 / 最新发布） |
+
+### 核心语义
+
+1. **仅展示一次的密钥**：`POST /subscribers` 返回随机密钥，服务端只存其 SHA-256 哈希，之后任何接口不再回传明文；缺失/无效密钥（含 `ack`/`status`）一律 **401**；
+2. **首批与回放**：新消费方游标为 0（首次以**空快照**比较，全部对象前值 `null`、`new_object: true`，既有事件全部计为新增）；**已有历史发布也可回放**（从发布 1 起按序领取）；
+3. **发布条目**：每条给出 `publication_id`、`baseline_publication_id`（所相对的上一发布编号，首批为 `null`）、`published_at`、`note`、`changed`，以及各站/责任区的 `status_before`/`status_after`/`changed`、`events_added`/`events_removed` 和打平后的 `events_added`/`events_removed`（带 `object_type`/`object_id`）与 `summary`；
+4. **无变化发布仍占序位**：相邻两次完全相同的发布是独立编号，条目标记 `changed: false`，下游确认/续号不得跳过；
+5. **事件身份与撤销**：事件按**对象（站/责任区）+ 类型（warning/cleared）+ 发生时刻 + 该对象同类型出现次数 `occurrence`** 识别（同刻多次同类事件可区分）；**追溯修订（作废/更正/追溯接管/阈值调整）造成的历史事件消失必须显示为撤销**（`events_removed`）；
+6. **只认真正冻结的快照**：发布条目只可能来自 `POST /publish` 或受控确认成功产生的发布行；**待发布变化不可见**，**失败的确认不产生发布、故不可见**；
+7. **拉取/确认协议**：
+   - 建立批次与发布在同一 `BEGIN IMMEDIATE` 事务内完成：**未确认前重复拉取返回同批**（同起止编号、同内容），期间的新发布留到确认后的下一批；
+   - 尚无新发布时返回空批（`releases: []`、`last_publication_id: null`、`has_more: false`），空批不改变游标；
+   - **确认只接受该批末尾编号**：越序（更大/跳号）或滞后（更小）→ **409** `out_of_order`；无未确认批次却确认非游标编号 → **409** `no_pending_batch`；
+   - **重复确认同一末尾编号幂等**（批次已清空、游标恰在该编号时仍返回 200）；
+8. **独立性与持久性**：各消费方游标**相互独立**（一行/消费方，随数据库持久化），**服务重启后可续读**；并发拉取与发布由单连接写事务串行化，**不漏项、不串项**（每发布每消费方恰好交付一次）。
+
+### 调用示例
+
+```bash
+# 1) 登记，取得仅展示一次的密钥
+KEY=$(curl -s -X POST http://127.0.0.1:8000/subscribers \
+  -H 'content-type: application/json' -d '{"name":"县防汛值班系统"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+
+# 2) 拉取未确认的下一批（未确认前重复调用返回同批）
+curl -s -H "X-Subscriber-Key: $KEY" \
+  'http://127.0.0.1:8000/subscriber/releases?limit=100'
+
+# 3) 只确认本批末尾编号（重复确认幂等；越序/无批次 409）
+curl -s -X POST http://127.0.0.1:8000/subscriber/ack \
+  -H "X-Subscriber-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"last_publication_id": 12}'
+
+# 4) 游标查询（重启后续读、排查卡点）
+curl -s -H "X-Subscriber-Key: $KEY" http://127.0.0.1:8000/subscriber/status
+```
+
+拉取响应（本批含发布 11、12；发布 12 中站 1 由预警转正常并新增解除、站 2 为新对象）：
+
+```json
+{
+  "subscriber_id": 1,
+  "acked_publication_id": 10,
+  "batch": {
+    "from_publication_id": 11,
+    "last_publication_id": 12,
+    "count": 2,
+    "releases": [
+      {
+        "publication_id": 11,
+        "published_at": "2026-10-03T01:00:00Z",
+        "note": "整点发布",
+        "baseline_publication_id": 10,
+        "changed": false,
+        "stations": [ {"station_id": 1, "station_name": "青石峡站", "status_before": "warning",
+                       "status_after": "warning", "changed": false, "new_object": false,
+                       "events_added": [], "events_removed": []} ],
+        "zones": [],
+        "events_added": [], "events_removed": [],
+        "summary": { "stations_total": 1, "stations_status_changed": 0, "stations_new": 0,
+                     "zones_total": 0, "zones_status_changed": 0, "zones_new": 0,
+                     "events_added": {"total":0,"station_warning":0,"station_cleared":0,"zone_warning":0,"zone_cleared":0},
+                     "events_removed": {"total":0,"station_warning":0,"station_cleared":0,"zone_warning":0,"zone_cleared":0} }
+      },
+      {
+        "publication_id": 12,
+        "published_at": "2026-10-03T02:00:00Z",
+        "note": "解除发布",
+        "baseline_publication_id": 11,
+        "changed": true,
+        "stations": [
+          {"station_id": 1, "station_name": "青石峡站", "status_before": "warning",
+           "status_after": "normal", "changed": true, "new_object": false,
+           "events_added":   [ {"type":"cleared","at":"2026-10-01T00:21:00Z","occurrence":1} ],
+           "events_removed": []},
+          {"station_id": 2, "station_name": "南河站", "status_before": null,
+           "status_after": "normal", "changed": false, "new_object": true,
+           "events_added": [], "events_removed": []}
+        ],
+        "zones": [],
+        "events_added": [ {"object_type":"station","object_id":1,"type":"cleared",
+                           "at":"2026-10-01T00:21:00Z","occurrence":1} ],
+        "events_removed": []
+      }
+    ]
+  },
+  "has_more": false,
+  "pulled_at": "2026-10-03T02:05:00Z"
+}
+```
+
+> 自包含演练（自动起临时服务，覆盖一次性密钥、空快照基准、无变化占序、重复拉取同批、越序拒绝/幂等确认、追溯修订显示撤销、失败确认不可见、游标独立与回放）：
+> `./examples/subscriber_demo.sh`
+
 ## 值班员受控发布（核对 → 凭凭证确认）
 
 值班员发布前必须先**核对**当前待发布裁定相对**最新公开快照**的变化，再凭核对返回的**一次性确认凭证**完成受控发布。直接发布接口 `POST /publish` 保持可用（向后兼容）。
@@ -371,13 +475,29 @@ curl -X POST http://127.0.0.1:8000/publish/confirm \
 | GET | `/public/current` | 最新发布的公开结果（含 `zone_timelines`） |
 | GET | `/public/stations/{id}/timeline` | 某站最新公开时间线 |
 
+### 下游断点领取（X-Subscriber-Key）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/subscribers` | 消费方登记（可选 `name`），返回仅展示一次的密钥 |
+| GET | `/subscriber/releases?limit=100` | 拉取未确认的下一批发布差异（相对上一发布；首次空快照；重复拉取同批） |
+| POST | `/subscriber/ack` | 确认 `{last_publication_id}`：仅接受批次末尾编号，重复确认幂等，越序/无批次 409 |
+| GET | `/subscriber/status` | 查询消费方游标（各消费方独立、重启续读） |
+
 ## 调用示例
 
-完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性** → **值班员受控发布核对/确认/变更后拒绝/凭证一次性** → **汛期设备轮值接管/选数/追溯重算/校验/凭证失效/预演选数**）：
+完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性** → **值班员受控发布核对/确认/变更后拒绝/凭证一次性** → **汛期设备轮值接管/选数/追溯重算/校验/凭证失效/预演选数** → **下游值班系统断点领取/一次性密钥/空快照基准/无变化占序/重复拉取同批/越序拒绝与幂等确认/游标独立/无效密钥**）：
 
 ```bash
 ./examples/demo.sh            # 默认打 http://127.0.0.1:8000
 BASE=http://127.0.0.1:8000 ./examples/demo.sh
+```
+
+下游断点领取另有**自包含、可重复执行**的专项演练（自动用临时数据库起停服务，另含追溯修订显示撤销、失败确认不可见、历史回放、重启续读）：
+
+```bash
+./examples/subscriber_demo.sh                       # 自动起临时服务
+BASE=http://127.0.0.1:8000 ./examples/subscriber_demo.sh   # 或复用已运行的服务
 ```
 
 curl 速览：
@@ -442,6 +562,16 @@ curl http://127.0.0.1:8000/zones/1/timeline
 # 发布后查询冻结的公开结果（责任区尚无发布时返回 404）
 curl -X POST http://127.0.0.1:8000/publish
 curl http://127.0.0.1:8000/public/zones/1/timeline
+
+# 下游值班系统断点领取：登记取一次性密钥 → 拉取未确认批次 → 确认批次末尾编号
+KEY=$(curl -s -X POST http://127.0.0.1:8000/subscribers \
+  -H 'content-type: application/json' -d '{"name":"县值班系统"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+curl -s -H "X-Subscriber-Key: $KEY" 'http://127.0.0.1:8000/subscriber/releases?limit=100'
+curl -s -X POST http://127.0.0.1:8000/subscriber/ack \
+  -H "X-Subscriber-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"last_publication_id":1}'
+curl -s -H "X-Subscriber-Key: $KEY" http://127.0.0.1:8000/subscriber/status
 ```
 
 ## 并发与一致性设计
@@ -453,6 +583,7 @@ curl http://127.0.0.1:8000/public/zones/1/timeline
 - 责任区配置（`zones` / `zone_members`）只登记、不修改，区域联动结果在读取与发布时按成员站当前待发布时间线实时重算；发布在单事务内为全部监测站与责任区生成快照，公开结果读取的是冻结快照，与后续写入（含补传、审核修订、阈值调整）互不影响。
 - **阈值预演为纯只读操作**：在一次 `db.read()`（同一连接 + 进程内锁）内完成现状与预演的全部单站/责任区裁定，候选版本仅以内存中的虚拟行（临时 id `-1`）参与计算，不开启写事务、不产生任何数据库写入；因此预演期间拿到的现状/预演取自同一数据视图，且绝不会影响待发布查询与已冻结发布。
 - **受控发布的乐观并发控制**：影响裁定的写入（站点/设备登记、读数新增、作废/更正、阈值版本、**设备接管登记**、责任区登记、发布）在同一事务内推进持久化的单调版本号 `app_meta.data_version`；核对时记录版本号与待发布结果摘要，确认时在 `BEGIN IMMEDIATE` 事务内校验版本与摘要、冻结并把凭证标记为已使用——核对与冻结原子完成，并发确认同一凭证恰有一次成功，任何插入的写入或他发布都会使确认以 409 拒绝且不留发布记录。幂等同内容重试与只读预演（阈值预演等）不推进版本。
+- **下游断点领取的游标一致性**：消费方密钥仅存哈希；游标（已确认编号 `acked_publication_id` + 未确认批次 `pending_from/pending_to`）按消费方独立行持久化，重启后续读。拉取在 `BEGIN IMMEDIATE` 事务内“确定批次范围 + 建立未确认批次”，与并发发布互斥：发布要么整体落入本批，要么留到下一批，不漏不串；未确认批次期间重复拉取只重放该批范围，不随新发布推进；确认在同事务内核验“末编号 == pending_to”并推进游标、清空批次，重复确认同一末编号幂等。发布差异完全取自 `publication_timelines`/`publication_zones` 的冻结快照（相邻发布互比，首批对空快照），复用与受控核对相同的 `(对象, 类型, 发生时刻, 出现次数)` 事件身份比较——待发布变化与失败确认不产生发布行，故天然对下游不可见。
 
 ## 测试
 
@@ -461,7 +592,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**阈值版本预演（同一校验/同刻 409 冲突、不落库不改待发布与冻结结果、本站与所属责任区现状/预演、其他成员站按待发布联动、同刻合并、与正式登记状态/事件类型/时刻一致）**、**汛期设备轮值接管（登记/列表、首条接管前全选、生效同刻边界、最近接管切换、缺测不借用、未入选可读、追溯/补传/更正/作废后按观测时间重算本站与责任区、校验 400/404/409、接管使核对凭证失效、公开快照须重发布才更新且历史不改写、阈值预演遵循选数、接管与阈值版本正交、跨设备断段）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整/**接管**重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、**值班员受控发布（空快照基准、新对象按空基准、状态前后值、按对象/类型/时刻/出现次数的新增消失事件、未知凭证 404、凭证一次性、核对后读数补传/作废/更正/阈值版本/责任区/站点/设备/**接管**写入或他发布先完成 → 409 且无发布记录、幂等重试与只读预演不影响凭证、校验冻结同事务、冻结内容与核对一致、并发确认仅一次成功、历史快照不改写）**、并发补传/发布不丢记录。
+覆盖：阈值/时间/水位/设备校验、幂等与冲突、预警与解除规则（含断段、乱序重排、跨段解除）、作废与更正重算、修订历史、**阈值版本（基准回退、同刻采用新版本、跨版本分别判定、调整不产生事件、快照冻结）**、**阈值版本预演（同一校验/同刻 409 冲突、不落库不改待发布与冻结结果、本站与所属责任区现状/预演、其他成员站按待发布联动、同刻合并、与正式登记状态/事件类型/时刻一致）**、**汛期设备轮值接管（登记/列表、首条接管前全选、生效同刻边界、最近接管切换、缺测不借用、未入选可读、追溯/补传/更正/作废后按观测时间重算本站与责任区、校验 400/404/409、接管使核对凭证失效、公开快照须重发布才更新且历史不改写、阈值预演遵循选数、接管与阈值版本正交、跨设备断段）**、**防汛责任区（登记校验、初始状态计入、同刻合并、K 达到/跌破、事件站 ID、补传/修订/阈值调整/**接管**重算、发布冻结与公开无结果、replay_zone 纯函数边界）**、发布冻结、**值班员受控发布（空快照基准、新对象按空基准、状态前后值、按对象/类型/时刻/出现次数的新增消失事件、未知凭证 404、凭证一次性、核对后读数补传/作废/更正/阈值版本/责任区/站点/设备/**接管**写入或他发布先完成 → 409 且无发布记录、幂等重试与只读预演不影响凭证、校验冻结同事务、冻结内容与核对一致、并发确认仅一次成功、历史快照不改写）**、并发补传/发布不丢记录、**下游断点领取（一次性密钥登记仅存哈希、密钥缺失/无效 401、空快照基准与 new_object、无变化发布占序、历史发布回放、重复拉取返回同批、确认仅接受批次末尾编号、越序/滞后/无批次 409、重复确认幂等、各消费方游标独立、重启后续读、追溯修订事件以撤销呈现、重复事件 occurrence 身份、待发布变化与失败确认不可见、受控确认成功可见、责任区差异、limit 分批与 has_more、并发拉取/发布不漏不串、并发同消费方拉取同批）**。
 
 ## 项目结构
 
@@ -469,12 +600,13 @@ pytest tests/ -q
 app/
   adjudication.py   # 裁定核心（纯函数：单站分段预警/解除 + 责任区跨站联动重放 replay_zone）
   config.py         # 环境变量配置
-  db.py             # SQLite 连接、事务与建表
+  db.py             # SQLite 连接、事务与建表（含 consumers/subscriber_cursors 游标表）
   schemas.py        # 请求模型与校验
   main.py           # FastAPI 路由与应用工厂
 tests/
   conftest.py       # 导入期重定向默认数据库，避免污染工作区
-  test_api.py       # 端到端测试（133 例）
-examples/demo.sh    # 调用示例脚本
+  test_api.py       # 端到端测试（158 例）
+examples/demo.sh             # 调用示例脚本（全功能）
+examples/subscriber_demo.sh  # 下游断点领取自包含演练（自动起临时服务，可重复执行）
 Dockerfile / docker-compose.yml
 ```

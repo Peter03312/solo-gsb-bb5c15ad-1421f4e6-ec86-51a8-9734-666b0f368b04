@@ -424,5 +424,77 @@ print("现状:", d["current"]["status"], "→ 预演:", d["preview"]["status"],
 '
 echo "预演不落库，版本数仍为: $(curl -s "$BASE/stations/8/threshold-versions" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["versions"]))')"
 
+# ---------------------------------------------------------------
+# 下游值班系统断点领取：登记一次性密钥 → 按批拉取发布差异 → 末编号确认
+# ---------------------------------------------------------------
+
+step "49. 下游值班系统登记：取得仅展示一次的领取密钥（服务端只存哈希）"
+SUB=$(curl -s -X POST "$BASE/subscribers" -H "$J" -d '{"name":"县防汛值班系统"}')
+echo "$SUB" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("消费方编号:",d["subscriber_id"],"| 密钥(仅本次返回):",d["key"])'
+SKEY=$(echo "$SUB" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')
+SK=(-H "X-Subscriber-Key: $SKEY")
+
+step "50. 拉取未确认的下一批发布（历史发布也可回放；每条相对上一发布给出状态前后值与事件新增/撤销）"
+curl -s "${SK[@]}" "$BASE/subscriber/releases?limit=3" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("已确认到发布:", d["acked_publication_id"], "| 本批:", d["batch"]["from_publication_id"],
+      "->", d["batch"]["last_publication_id"], "| 还有后续:", d["has_more"])
+for r in d["batch"]["releases"]:
+    print("  发布", r["publication_id"], "基准发布", r["baseline_publication_id"],
+          "时间", r["published_at"], "changed=", r["changed"])
+    for s in r["stations"]:
+        if s["changed"] or s["new_object"] or s["events_added"] or s["events_removed"]:
+            print("    站%s: %s -> %s 新增 %s 撤销 %s"
+                  % (s["station_id"], s["status_before"], s["status_after"],
+                     [(e["type"], e["at"], e["occurrence"]) for e in s["events_added"]],
+                     [(e["type"], e["at"], e["occurrence"]) for e in s["events_removed"]]))
+    for z in r["zones"]:
+        if z["changed"] or z["new_object"] or z["events_added"] or z["events_removed"]:
+            print("    区域%s: %s -> %s 新增 %s 撤销 %s"
+                  % (z["zone_id"], z["status_before"], z["status_after"],
+                     [e["type"] for e in z["events_added"]],
+                     [e["type"] for e in z["events_removed"]]))
+'
+
+step "51. 未确认前重复拉取返回同批（即便新发布已产生，也不漏不串）"
+curl -s -X POST "$BASE/publish" -H "$J" -d '{"note":"下游演示期间的新发布"}' > /dev/null
+echo "再次拉取的批次末编号: $(curl -s "${SK[@]}" "$BASE/subscriber/releases?limit=3" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch"]["last_publication_id"])')（与步骤 50 相同）"
+
+step "52. 确认只接受该批末尾编号：越序 409、正确编号 200；重复确认幂等"
+LAST=$(curl -s "${SK[@]}" "$BASE/subscriber/releases?limit=3" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch"]["last_publication_id"])')
+curl -s -o /dev/null -w "确认越序编号 1（实际末尾 $LAST）→ HTTP %{http_code}\n" \
+  -X POST "$BASE/subscriber/ack" "${SK[@]}" -H "$J" -d "{\"last_publication_id\":1}"
+curl -s -w ' [HTTP %{http_code}]\n' -X POST "$BASE/subscriber/ack" "${SK[@]}" -H "$J" \
+  -d "{\"last_publication_id\":$LAST}" | python3 -c '
+import sys
+raw = sys.stdin.read()
+body, _, code = raw.partition("[HTTP")
+import json
+d = json.loads(body)
+print("确认成功，游标推进到:", d["acked_publication_id"], "| 下次从", d["next_from_publication_id"], "开始", "[" + code.strip(), end="")
+'
+curl -s -o /dev/null -w "重复确认同一末尾编号（幂等）→ HTTP %{http_code}\n" \
+  -X POST "$BASE/subscriber/ack" "${SK[@]}" -H "$J" -d "{\"last_publication_id\":$LAST}"
+curl -s -o /dev/null -w "无效密钥拉取 → HTTP %{http_code}\n" "$BASE/subscriber/releases"
+
+step "53. 游标查询：各消费方独立、服务重启后可续读"
+curl -s "${SK[@]}" "$BASE/subscriber/status" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("消费方", d["subscriber_id"], "| 已确认到:", d["acked_publication_id"],
+      "| 下次从:", d["next_from_publication_id"], "| 未确认批次:", d["pending_batch"],
+      "| 最新发布:", d["latest_publication_id"])
+'
+echo "下一次拉取将得到步骤 51 期间产生的新发布："
+curl -s "${SK[@]}" "$BASE/subscriber/releases" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("  本批发布号:", [r["publication_id"] for r in d["batch"]["releases"]],
+      "| has_more:", d["has_more"])
+'
+
 echo
 echo "演示完成。交互式文档：$BASE/docs"
