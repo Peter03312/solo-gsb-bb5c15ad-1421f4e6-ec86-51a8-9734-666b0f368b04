@@ -123,6 +123,27 @@ CREATE TABLE IF NOT EXISTS app_meta (
     value TEXT NOT NULL
 );
 
+-- 下游值班系统：公开预警变更的断点领取消费方。
+-- secret 仅在登记响应中明文展示一次，服务端只存其 SHA-256 哈希；
+-- cursor 为该消费方已确认到的发布编号（0=尚未确认任何发布，首次拉取以空快照为基准）。
+CREATE TABLE IF NOT EXISTS feed_consumers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    secret_hash TEXT NOT NULL UNIQUE,
+    cursor      INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL
+);
+
+-- 各消费方“拉取后未确认”的当前批次：记录该批末尾发布编号。
+-- 未确认前重复拉取一律返回 (cursor, end_id] 这同一批；确认后删除行并推进 cursor。
+-- 每消费方至多一行，消费方游标互不影响。
+CREATE TABLE IF NOT EXISTS feed_pending_batches (
+    consumer_id INTEGER PRIMARY KEY REFERENCES feed_consumers(id),
+    end_id      INTEGER NOT NULL,
+    truncated   INTEGER NOT NULL DEFAULT 0,   -- 锁定当时末尾之后是否仍有未入批发布（受 limit 截断等）
+    created_at  TEXT NOT NULL
+);
+
 -- 受控发布核对凭证（POST /publish/checks）：一次核对一行，确认成功后标记 used。
 -- data_version 记录核对时的数据版本；任何影响裁定的写入都会推进 data_version，
 -- 使旧凭证在确认时以 409 作废。

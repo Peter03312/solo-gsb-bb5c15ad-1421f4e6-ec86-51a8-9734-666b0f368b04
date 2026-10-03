@@ -246,6 +246,69 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `POST /publish` 的响应、`GET /publications/{id}` 与 `GET /public/current` 在原有字段之外**新增** `zones` / `zone_timelines`（公开负载中均带 `published: true`）；原有字段与其他接口的请求响应保持不变。
 
+## 下游值班系统：公开预警变更断点领取
+
+下游值班系统（消费方）以**断点领取**方式订阅**已公开发布**的预警变更：登记后取得**仅展示一次**的拉取密钥，凭密钥拉取未确认的下一批发布，处理完只确认该批末尾编号。各消费方游标相互独立，状态持久化、服务重启后可续读。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/feed/consumers` | 登记消费方 `{name}`，返回 `secret`（**仅展示一次**，服务端只存 SHA-256 哈希） |
+| GET | `/feed/consumers/me` | 凭密钥查询本消费方游标、最新发布编号与当前待确认批次 |
+| GET | `/feed/releases?limit=100` | 拉取未确认的下一批发布变更（1~1000，默认 100） |
+| POST | `/feed/ack` | 确认当前批次：`{"acknowledge_publication_id": <本批末尾编号>}` |
+
+所有订阅接口（登记除外）均须携带请求头 `X-Feed-Secret: <secret>`，缺失/未知密钥 → **401**。
+
+领取与差异语义：
+
+1. **首次以空快照比较**：每个发布返回其编号及相对**上一发布**的各监测站、责任区 `status_before / status_after / changed / new_object`、责任区预警站 ID 前后值，以及预警/解除事件的新增 `events_added` 与撤销 `events_removed`；事件按**对象、类型、发生时刻及该对象同类型出现次数**（`occurrence`）识别，追溯修订造成的历史事件消失体现为**撤销**；
+2. **无变化发布仍占序位**（`changed=false`，事件列表为空）；**已有历史发布也可回放**——后登记的消费方游标为 0，从发布 #1 开始领取；
+3. **只依据直接发布（`POST /publish`）或受控确认成功（`POST /publish/confirm`）冻结的快照**；待发布变化与失败的核对确认不可见；
+4. **未确认前重复拉取返回同一批**：首次拉取到内容时锁定批次 `(cursor, last_publication_id]`，期间新发布不进本批；空批（无新发布）不落锁、可反复拉取；
+5. **确认仅接受该批末尾编号**：越序（超前/滞后）→ **409** `out_of_sequence`；未知发布编号 → **404**；无待确认批次时确认已消费过的编号**幂等**（`duplicate=true`），其余 → **409** `no_pending_batch`；
+6. **游标独立且持久**：确认后仅推进本消费方游标；批次与游标均入库，**服务重启后可续读**；全部拉取/确认与发布共用 `BEGIN IMMEDIATE` 串行写事务，并发拉取或发布**不漏项、不串项**。
+
+`GET /feed/releases` 响应：
+
+```json
+{
+  "consumer_id": 7,
+  "cursor": 3,
+  "batch": {"first_publication_id": 4, "last_publication_id": 5, "size": 2, "truncated": false},
+  "releases": [
+    {
+      "publication_id": 4,
+      "published_at": "2026-10-03T02:30:00Z",
+      "note": "值班员确认发布",
+      "previous_publication_id": 3,
+      "changed": true,
+      "stations": [
+        {"station_id": 1, "station_name": "青石峡站",
+         "status_before": "warning", "status_after": "normal", "changed": true, "new_object": false,
+         "events_added":   [{"type":"cleared", "at":"2026-10-01T00:26:00Z", "occurrence": 1}],
+         "events_removed": []}
+      ],
+      "zones": [
+        {"zone_id": 1, "zone_name": "青石峡片区", "trigger_count": 2,
+         "status_before": "warning", "status_after": "normal", "changed": true, "new_object": false,
+         "warning_station_ids_before": [1, 2], "warning_station_ids_after": [],
+         "events_added":   [{"type":"cleared", "at":"2026-10-01T00:26:00Z", "occurrence": 1}],
+         "events_removed": []}
+      ],
+      "events_added":   [{"object_type":"station","object_id":1,"type":"cleared","at":"2026-10-01T00:26:00Z","occurrence":1}],
+      "events_removed": [{"object_type":"station","object_id":1,"type":"warning","at":"2026-10-01T00:10:00Z","occurrence":1}],
+      "summary": {"stations_total": 1, "stations_status_changed": 1, "stations_new": 0,
+                  "zones_total": 1, "zones_status_changed": 1, "zones_new": 0,
+                  "events_added":   {"total":2,"station_warning":0,"station_cleared":1,"zone_warning":0,"zone_cleared":1},
+                  "events_removed": {"total":1,"station_warning":1,"station_cleared":0,"zone_warning":0,"zone_cleared":0}}
+    }
+  ]
+}
+```
+
+> 批次被 `limit` 截断时 `truncated=true`：确认末尾编号后再次拉取即得到后续发布。
+> 端到端调用示例见 `./examples/feed_demo.sh`（`BASE=http://127.0.0.1:8000 ./examples/feed_demo.sh`）。
+
 ## 值班员受控发布（核对 → 凭凭证确认）
 
 值班员发布前必须先**核对**当前待发布裁定相对**最新公开快照**的变化，再凭核对返回的**一次性确认凭证**完成受控发布。直接发布接口 `POST /publish` 保持可用（向后兼容）。
@@ -371,6 +434,15 @@ curl -X POST http://127.0.0.1:8000/publish/confirm \
 | GET | `/public/current` | 最新发布的公开结果（含 `zone_timelines`） |
 | GET | `/public/stations/{id}/timeline` | 某站最新公开时间线 |
 
+### 下游变更订阅（断点领取）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/feed/consumers` | 登记消费方，返回仅展示一次的密钥（缺失/空白名称 400） |
+| GET | `/feed/consumers/me` | 查询本消费方游标与待确认批次（密钥无效 401） |
+| GET | `/feed/releases?limit=100` | 拉取未确认的下一批发布变更（limit 1~1000；密钥无效 401） |
+| POST | `/feed/ack` | 确认本批末尾编号（越序 409、未知发布 404、重复确认幂等、密钥无效 401） |
+
 ## 调用示例
 
 完整端到端示例脚本（登记 → 补传 → 幂等重试 → 冲突 → 预警 → 发布 → 解除 → 更正 → 重发布 → 作废 → 阈值版本 → **责任区登记/同刻合并/初始状态/发布冻结/公开无结果** → **阈值调整预演/不落库/同刻冲突/登记一致性** → **值班员受控发布核对/确认/变更后拒绝/凭证一次性** → **汛期设备轮值接管/选数/追溯重算/校验/凭证失效/预演选数**）：
@@ -442,6 +514,16 @@ curl http://127.0.0.1:8000/zones/1/timeline
 # 发布后查询冻结的公开结果（责任区尚无发布时返回 404）
 curl -X POST http://127.0.0.1:8000/publish
 curl http://127.0.0.1:8000/public/zones/1/timeline
+
+# 下游值班系统断点领取：登记（密钥仅展示一次）→ 拉取 → 确认末尾编号
+SECRET=$(curl -s -X POST http://127.0.0.1:8000/feed/consumers \
+  -H 'content-type: application/json' -d '{"name":"下游值班甲班"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["secret"])')
+curl -s "http://127.0.0.1:8000/feed/releases?limit=100" -H "X-Feed-Secret: $SECRET"
+# 用返回的 batch.last_publication_id 确认（越序 409，重复确认幂等）
+curl -s -X POST http://127.0.0.1:8000/feed/ack \
+  -H 'content-type: application/json' -H "X-Feed-Secret: $SECRET" \
+  -d '{"acknowledge_publication_id": 1}'
 ```
 
 ## 并发与一致性设计
@@ -453,6 +535,7 @@ curl http://127.0.0.1:8000/public/zones/1/timeline
 - 责任区配置（`zones` / `zone_members`）只登记、不修改，区域联动结果在读取与发布时按成员站当前待发布时间线实时重算；发布在单事务内为全部监测站与责任区生成快照，公开结果读取的是冻结快照，与后续写入（含补传、审核修订、阈值调整）互不影响。
 - **阈值预演为纯只读操作**：在一次 `db.read()`（同一连接 + 进程内锁）内完成现状与预演的全部单站/责任区裁定，候选版本仅以内存中的虚拟行（临时 id `-1`）参与计算，不开启写事务、不产生任何数据库写入；因此预演期间拿到的现状/预演取自同一数据视图，且绝不会影响待发布查询与已冻结发布。
 - **受控发布的乐观并发控制**：影响裁定的写入（站点/设备登记、读数新增、作废/更正、阈值版本、**设备接管登记**、责任区登记、发布）在同一事务内推进持久化的单调版本号 `app_meta.data_version`；核对时记录版本号与待发布结果摘要，确认时在 `BEGIN IMMEDIATE` 事务内校验版本与摘要、冻结并把凭证标记为已使用——核对与冻结原子完成，并发确认同一凭证恰有一次成功，任何插入的写入或他发布都会使确认以 409 拒绝且不留发布记录。幂等同内容重试与只读预演（阈值预演等）不推进版本。
+- **下游变更订阅的断点领取**：消费方密钥仅以 SHA-256 哈希入库（`feed_consumers.secret_hash`），每消费方持久化独立游标 `cursor` 与至多一行的待确认批次（`feed_pending_batches`）；拉取在写事务内“首次见新发布即锁定末尾编号、重复拉取只读本批”，确认在同一类事务内校验“编号恰为末尾”后删除批次并推进游标——拉取、确认与发布共用同一进程锁与 `BEGIN IMMEDIATE`，并发发布/领取不漏项、不串项，重启后按入库游标与批次续读；差异内容全部取自已冻结快照表（`publication_timelines` / `publication_zones`），待发布数据与失败确认对消费方不可见。
 
 ## 测试
 
@@ -475,6 +558,8 @@ app/
 tests/
   conftest.py       # 导入期重定向默认数据库，避免污染工作区
   test_api.py       # 端到端测试（133 例）
+  test_feed_api.py  # 下游变更订阅端到端测试（22 例）
 examples/demo.sh    # 调用示例脚本
+examples/feed_demo.sh  # 下游变更订阅（断点领取）调用示例脚本
 Dockerfile / docker-compose.yml
 ```

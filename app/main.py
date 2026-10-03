@@ -14,7 +14,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -25,6 +25,8 @@ from .schemas import (
     CorrectRequest,
     DeviceCreate,
     DeviceTakeoverCreate,
+    FeedAckRequest,
+    FeedConsumerCreate,
     PublishConfirmRequest,
     PublishRequest,
     ReadingIngest,
@@ -171,7 +173,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="山洪水位预警裁定服务",
-        version="1.5.0",
+        version="1.6.0",
         description="监测站/设备登记、汛期一站多设备轮值接管选数、读数补传（幂等）、审核修订、阈值版本（含不落库预演）、单站预警裁定、防汛责任区跨站联动，以及受控发布（核对凭证 → 确认冻结）。",
     )
     app.state.db = db
@@ -1558,6 +1560,262 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "published_at": row["published_at"],
             "published": True,
             **json.loads(row["timeline_json"]),
+        }
+
+    # -------------------------------------------------- 下游变更订阅（断点领取）
+
+    def frozen_payload_for_diff(conn: sqlite3.Connection, pub_id: int) -> dict[str, Any]:
+        """读取某次已冻结发布的全部站点/责任区时间线（结构与 build_pending_payload 一致）。"""
+        indexed = load_baseline_payload(conn, pub_id)
+        return {
+            "stations": [indexed["stations"][k] for k in sorted(indexed["stations"])],
+            "zones": [indexed["zones"][k] for k in sorted(indexed["zones"])],
+        }
+
+    def publication_row_or_404(conn: sqlite3.Connection, pub_id: int) -> sqlite3.Row:
+        pub = conn.execute("SELECT * FROM publications WHERE id=?", (pub_id,)).fetchone()
+        if pub is None:
+            raise HTTPException(status_code=404, detail=f"发布 {pub_id} 不存在")
+        return pub
+
+    def release_prev_row(conn: sqlite3.Connection, pub_id: int) -> Optional[sqlite3.Row]:
+        """返回相对该发布的“上一发布”（编号严格小一号的最近发布；无则 None=空快照）。"""
+        return conn.execute(
+            "SELECT * FROM publications WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (pub_id,),
+        ).fetchone()
+
+    def build_release_entry(conn: sqlite3.Connection, pub: sqlite3.Row) -> dict[str, Any]:
+        """单个发布相对上一发布（首次为空快照）的变更条目。
+
+        站点/责任区状态前后值与新增/撤销事件复用受控发布核对的同一差异算法：
+        事件按（对象、类型、发生时刻、该对象同类型出现次数）识别，追溯修订造成的
+        事件消失体现为撤销；无变化发布仍占序位（changed=false）。
+        """
+        prev = release_prev_row(conn, pub["id"])
+        pending = frozen_payload_for_diff(conn, pub["id"])
+        diff = build_check_result(conn, prev, pending)
+        changed = (
+            diff["summary"]["stations_status_changed"] > 0
+            or diff["summary"]["stations_new"] > 0
+            or diff["summary"]["zones_status_changed"] > 0
+            or diff["summary"]["zones_new"] > 0
+            or diff["summary"]["events_added"]["total"] > 0
+            or diff["summary"]["events_removed"]["total"] > 0
+        )
+        return {
+            "publication_id": pub["id"],
+            "published_at": pub["published_at"],
+            "note": pub["note"],
+            "previous_publication_id": prev["id"] if prev is not None else None,
+            "changed": changed,
+            "stations": diff["stations"],
+            "zones": diff["zones"],
+            "events_added": diff["events_added"],
+            "events_removed": diff["events_removed"],
+            "summary": diff["summary"],
+        }
+
+    def authenticate_consumer(
+        conn: sqlite3.Connection, x_feed_secret: Optional[str]
+    ) -> sqlite3.Row:
+        """凭消费方密钥鉴权：密钥仅存 SHA-256 哈希；缺失/未知 → 401。"""
+        if not x_feed_secret or not x_feed_secret.strip():
+            raise HTTPException(status_code=401, detail="缺少消费方密钥（X-Feed-Secret 头）")
+        secret = x_feed_secret.strip()
+        row = conn.execute(
+            "SELECT * FROM feed_consumers WHERE secret_hash=?",
+            (hash_token(secret),),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=401, detail="无效的消费方密钥")
+        return row
+
+    @app.post("/feed/consumers", status_code=201, tags=["下游变更订阅"])
+    def register_feed_consumer(body: FeedConsumerCreate) -> dict[str, Any]:
+        """登记下游值班系统消费方，发放**仅展示一次**的拉取密钥。
+
+        服务端只保存密钥的 SHA-256 哈希，请消费方自行妥善保存明文；
+        丢失无法找回，只能重新登记。新消费方游标为 0，可回放全部历史发布。
+        """
+        now = iso_z(utc_now())
+        secret = secrets.token_urlsafe(32)
+        with db.write_tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO feed_consumers(name, secret_hash, cursor, created_at) VALUES (?,?,0,?)",
+                (body.name, hash_token(secret), now),
+            )
+            consumer_id = cur.lastrowid
+        return {
+            "consumer_id": consumer_id,
+            "name": body.name,
+            "secret": secret,
+            "secret_shown_once": True,
+            "cursor": 0,
+            "created_at": now,
+        }
+
+    @app.get("/feed/consumers/me", tags=["下游变更订阅"])
+    def feed_consumer_me(x_feed_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+        """凭密钥查询本消费方游标与当前待确认批次（不推进、不锁定任何发布）。"""
+        with db.read() as conn:
+            consumer = authenticate_consumer(conn, x_feed_secret)
+            batch = conn.execute(
+                "SELECT * FROM feed_pending_batches WHERE consumer_id=?",
+                (consumer["id"],),
+            ).fetchone()
+            latest = latest_publication_row(conn)
+        return {
+            "consumer_id": consumer["id"],
+            "name": consumer["name"],
+            "cursor": consumer["cursor"],
+            "latest_publication_id": latest["id"] if latest is not None else None,
+            "pending_batch": (
+                {
+                    "first_publication_id": consumer["cursor"] + 1,
+                    "last_publication_id": batch["end_id"],
+                    "size": batch["end_id"] - consumer["cursor"],
+                }
+                if batch is not None
+                else None
+            ),
+            "created_at": consumer["created_at"],
+        }
+
+    @app.get("/feed/releases", tags=["下游变更订阅"])
+    def feed_pull(
+        limit: int = 100,
+        x_feed_secret: Optional[str] = Header(default=None),
+    ) -> dict[str, Any]:
+        """拉取本消费方**尚未确认**的下一批公开发布变更。
+
+        - 首次以空快照为基准（cursor=0），可回放已有历史发布；
+        - 每个发布返回编号及相对上一发布的站点/责任区状态前后值与新增/撤销事件，
+          无变化发布仍占序位（changed=false）；
+        - 未确认前重复拉取返回同一批（批次在首次拉取到内容时锁定）；
+          确认后才会推进游标、拉取后续新发布；
+        - 无新发布时返回空批，不锁定、可再次拉取；
+        - 差异只来自直接发布或受控确认成功冻结的快照，待发布变化与失败确认不可见。
+        """
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="limit 取值范围为 1~1000")
+        with db.write_tx() as conn:
+            consumer = authenticate_consumer(conn, x_feed_secret)
+            consumer_id = consumer["id"]
+            cursor = consumer["cursor"]
+
+            batch = conn.execute(
+                "SELECT * FROM feed_pending_batches WHERE consumer_id=?",
+                (consumer_id,),
+            ).fetchone()
+            truncated = False
+            if batch is None:
+                latest = latest_publication_row(conn)
+                end_id = latest["id"] if latest is not None else cursor
+                if end_id > cursor:
+                    # 仅当确有新发布时才锁定批次；空批不落锁，便于随后无副作用地再拉
+                    if end_id - cursor > limit:
+                        end_id = cursor + limit
+                        truncated = True
+                    elif _has_later_publication(conn, end_id):
+                        truncated = True
+                    conn.execute(
+                        "INSERT INTO feed_pending_batches(consumer_id, end_id, truncated, created_at)"
+                        " VALUES (?,?,?,?)",
+                        (consumer_id, end_id, 1 if truncated else 0, iso_z(utc_now())),
+                    )
+            else:
+                end_id = batch["end_id"]
+                truncated = bool(batch["truncated"])
+
+            pub_rows = conn.execute(
+                "SELECT * FROM publications WHERE id > ? AND id <= ? ORDER BY id",
+                (cursor, end_id),
+            ).fetchall()
+            releases = [build_release_entry(conn, pub) for pub in pub_rows]
+
+        return {
+            "consumer_id": consumer_id,
+            "cursor": cursor,
+            "batch": {
+                "first_publication_id": releases[0]["publication_id"] if releases else None,
+                "last_publication_id": end_id if releases else None,
+                "size": len(releases),
+                # 批次锁定当时末尾之后是否仍有未入批发布（受 limit 截断或锁定后有新发布）
+                "truncated": truncated,
+            },
+            "releases": releases,
+        }
+
+    def _has_later_publication(conn: sqlite3.Connection, pub_id: int) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM publications WHERE id > ? LIMIT 1", (pub_id,)
+        ).fetchone() is not None
+
+    @app.post("/feed/ack", status_code=200, tags=["下游变更订阅"])
+    def feed_ack(body: FeedAckRequest, x_feed_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+        """确认已处理当前批次。
+
+        - 仅接受当前待确认批的**末尾发布编号**，确认后游标推进、批次解除锁定；
+        - 重复确认同一末尾编号幂等（已确认过 → duplicate=true）；
+        - 越序确认（不是本批末尾，含超前/滞后）→ 409 out_of_sequence；
+        - 无待确认批次时的任何编号 → 409 no_pending_batch；未知发布编号 → 404；
+        - 密钥无效 → 401。各消费方游标独立，状态持久化、重启后可续读。
+        """
+        ack_id = body.acknowledge_publication_id
+        with db.write_tx() as conn:
+            consumer = authenticate_consumer(conn, x_feed_secret)
+            consumer_id = consumer["id"]
+            cursor = consumer["cursor"]
+
+            publication_row_or_404(conn, ack_id)
+            batch = conn.execute(
+                "SELECT * FROM feed_pending_batches WHERE consumer_id=?",
+                (consumer_id,),
+            ).fetchone()
+            if batch is None:
+                if ack_id <= cursor:
+                    return {
+                        "consumer_id": consumer_id,
+                        "acknowledged_publication_id": ack_id,
+                        "cursor": cursor,
+                        "duplicate": True,
+                    }
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "no_pending_batch",
+                        "message": "当前没有待确认的拉取批次，请先拉取再确认",
+                        "cursor": cursor,
+                    },
+                )
+
+            end_id = batch["end_id"]
+            if ack_id != end_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "out_of_sequence",
+                        "message": "确认仅接受当前批次的末尾发布编号",
+                        "expected_publication_id": end_id,
+                        "received_publication_id": ack_id,
+                    },
+                )
+
+            conn.execute(
+                "DELETE FROM feed_pending_batches WHERE consumer_id=?",
+                (consumer_id,),
+            )
+            conn.execute(
+                "UPDATE feed_consumers SET cursor=? WHERE id=?",
+                (end_id, consumer_id),
+            )
+
+        return {
+            "consumer_id": consumer_id,
+            "acknowledged_publication_id": end_id,
+            "cursor": end_id,
+            "duplicate": False,
         }
 
     # ------------------------------------------------------------ 健康检查

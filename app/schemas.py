@@ -134,3 +134,24 @@ class ZoneCreate(BaseModel):
         if self.trigger_count > len(self.station_ids):
             raise ValueError("触发站数 K 不得大于成员站数量")
         return self
+
+
+class FeedConsumerCreate(BaseModel):
+    """登记下游变更消费方：仅需一个非空名称，成功后服务端发放只展示一次的密钥。"""
+
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(min_length=1, max_length=200, description="消费方名称（非空）")
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("名称不得为空白")
+        return v
+
+
+class FeedAckRequest(BaseModel):
+    """确认一批公开变更：仅接受该批末尾的发布编号（acknowledge_publication_id）。"""
+
+    model_config = ConfigDict(extra="ignore")
+    acknowledge_publication_id: int = Field(ge=1, description="本批拉取结果的末尾发布编号")
